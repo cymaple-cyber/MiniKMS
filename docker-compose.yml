@@ -1,0 +1,14 @@
+services:
+  minikms:
+    build: .
+    container_name: minikms
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: sqlite:///./data/minikms.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+

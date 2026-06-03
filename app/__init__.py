@@ -1,0 +1,2 @@
+"""MiniKMS application package."""
+
