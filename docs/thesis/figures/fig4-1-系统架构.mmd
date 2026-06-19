@@ -1,0 +1,21 @@
+%% 图 4-1 系统总体架构
+flowchart TB
+    C["客户端 / Swagger<br/>Admin · Key Manager · App User"]
+    subgraph HOST["Host：MiniKMS（FastAPI，不持有主密钥）"]
+        direction TB
+        API["API 路由层<br/>auth · users · keys · crypto · audit"]
+        SVC["服务层<br/>auth · key · crypto · audit · enclave_client"]
+        SEC["横切：JWT 鉴权 · RBAC · 审计"]
+        API --> SVC
+        SVC -.-> SEC
+    end
+    DB[("SQLite 数据库<br/>用户 · 密钥元数据 · 包装后 DEK · 业务密文 · 审计日志")]
+    subgraph ENC["Enclave：KmsEnclave（模拟 TEE，可信区）"]
+        direction TB
+        MK["Master Key（仅驻留于此）"]
+        OPS["生成/包装/解包 DEK<br/>AES-GCM 数据加解密"]
+        MK --> OPS
+    end
+    C -- "① HTTP + JWT" --> API
+    SVC -- "ORM 读写" --> DB
+    SVC -- "② 远程认证 + AES-GCM 信道<br/>kms_generate_wrapped_dek / kms_encrypt / kms_decrypt" --> OPS

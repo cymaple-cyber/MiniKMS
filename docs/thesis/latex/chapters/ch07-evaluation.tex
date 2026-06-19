@@ -1,0 +1,95 @@
+% ==================== 第 7 章 测试与实验评估 ====================
+\chapter{测试与实验评估}
+\label{ch:eval}
+
+本章通过自动化测试与分析性评估验证系统是否满足第~\ref{ch:threat}~章的安全需求与功能目标。内容包括测试策略、功能测试、安全属性验证、性能评估设计以及与云 KMS 的定性对比。为遵循“不虚构未实现功能”的原则，本章明确区分\textbf{已由测试验证}的结论与\textbf{设计级/待测}的结论。
+
+\section{测试策略}
+
+系统采用基于 pytest 与 FastAPI TestClient 的自动化测试，分为两组：本地模式的 API 测试（\code{tests/test_minikms_api.py}）与可信模式的集成测试（\code{tests/test_trusted_kms.py}）。后者在测试内启动一个真实的 \code{KmsEnclave} 线程并通过环回 TCP 连接，因此可端到端地验证远程认证、安全信道与 Enclave 后端加解密。两组共 8 个测试用例，最近一次运行结果为全部通过（8 passed）。
+
+\section{功能测试}
+
+8 个测试用例及其验证内容与关联需求如表~\ref{tab:tests} 所示。
+
+\begin{table}[H]
+\centering
+\caption{功能测试用例}
+\label{tab:tests}
+\footnotesize
+\begin{tabularx}{\textwidth}{c Y L{3.0cm}}
+\toprule
+\# & 测试用例与验证内容 & 关联需求 \\
+\midrule
+1 & 首个注册用户自动成为 Admin，可登录并访问 \code{/auth/me} & 鉴权 \\
+2 & 口令以 bcrypt 哈希存储（以 \code{\$2} 开头），非明文 & T7 \\
+3 & Admin 可创建用户；App User 创建密钥被拒（403），审计含 \code{permission_denied} & SR7 / T6 \\
+4 & 创建与加解密往返；响应不含密钥材料；禁用/吊销后拒绝加解密；销毁后数据库中包装材料被擦空 & SR3 / SR5 / T1 \\
+5 & 轮换后版本号递增为 2；新旧版本密文均可正确解密 & SR4 \\
+6 & 审计记录登录成功/失败、创建/查询密钥、加密、销毁等动作 & SR6 \\
+7 & 可信模式加解密往返一致；健康检查 \code{crypto_backend=enclave}、\code{enclave=connected} & SR1 / SR8 \\
+8 & 可信模式轮换后仍可解密旧版本密文 & SR4 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+用例 7 与 8 尤为关键：它们在真实启动的 Enclave 与已建立的安全信道之上完成加解密往返与跨版本解密，从而端到端地验证了远程认证、AES-GCM 信道与 Enclave 后端的联通与正确性，对应可信模式的核心设计。
+
+\section{安全属性验证}
+
+在功能测试之外，本节对关键安全属性作进一步说明，并标注其验证层级。
+
+\begin{itemize}
+  \item \textbf{主密钥不在 Host（SR1）。} 可信模式下配置层强制将 Host 的 \code{master_key} 置空（见第~\ref{ch:design}~章），可信集成测试的运行环境亦显式删除了 Host 的 \code{MASTER_KEY} 环境变量；健康检查显示 \code{crypto_backend=enclave}，加解密由 Enclave 承载。\emph{（测试 + 设计验证）}
+  \item \textbf{数据库不含明文密钥材料（T1/SR5）。} 测试断言密钥创建与查询响应中不含 \code{encrypted_key_material} 与 \code{nonce} 字段；销毁后直接查询数据库确认包装材料已被置空。\emph{（测试验证）}
+  \item \textbf{密文完整性（T4）。} AES-GCM 的认证标签在设计上保证任何对密文的篡改都会导致解密失败；当前测试覆盖了状态非法（禁用/吊销）导致的解密拒绝，\textbf{尚未包含针对密文比特翻转的专门篡改用例}，可作为测试补强项。\emph{（设计验证）}
+  \item \textbf{统一错误（SR3）。} 解包与解密失败均返回通用错误信息，不泄露内部异常细节。\emph{（设计 + 用例 4 间接验证）}
+\end{itemize}
+
+\section{性能评估设计}
+
+为量化将敏感操作迁移至 Enclave 所引入的进程间通信（IPC）开销，可设计本地模式与可信模式的延迟对比实验：在相同负载下分别测量创建密钥、加密、解密三类操作的延迟，并统计 P50 与 P95。实验设计如表~\ref{tab:perf} 所示。
+
+\begin{table}[H]
+\centering
+\caption{性能对比实验设计（本地模式 vs.\ 可信模式）}
+\label{tab:perf}
+\small
+\begin{tabularx}{\textwidth}{L{3.2cm} C{2.4cm} C{2.4cm} Y}
+\toprule
+操作 & 本地 P50/P95 & 可信 P50/P95 & 说明 \\
+\midrule
+创建密钥 & ---\,/\,--- & ---\,/\,--- & 含一次 \code{kms_generate_wrapped_dek} \\
+加密 & ---\,/\,--- & ---\,/\,--- & 含一次 \code{kms_encrypt} \\
+解密 & ---\,/\,--- & ---\,/\,--- & 含一次 \code{kms_decrypt} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+需\textbf{诚实说明}：本文当前未提供该实验的实测数值，表~\ref{tab:perf} 仅给出实验设计与待填栏位。从原理上预期可信模式因增加了一次本地 IPC 往返与一次会话层 AES-GCM 加解密，单次操作延迟将略高于本地模式，但二者均应处于可接受范围；具体数值留待后续补充。
+
+\section{与云 KMS 的对比讨论}
+
+本文系统在定位上是教学/研究原型，与生产级云 KMS 存在显著差异，定性对比如表~\ref{tab:cloudkms} 所示。对比的目的不在于宣称本文系统达到生产水平，而在于厘清其适用边界。
+
+\begin{table}[H]
+\centering
+\caption{本文系统与云 KMS 的定性对比}
+\label{tab:cloudkms}
+\small
+\begin{tabularx}{\textwidth}{L{3.0cm} Y Y}
+\toprule
+维度 & 本文系统 & 生产级云 KMS \\
+\midrule
+密钥隔离 & 软件模拟 Enclave（进程级） & HSM / 硬件 TEE（硬件级） \\
+远程认证 & 结构性模拟（对称、明文身份密钥） & 硬件根信任、非对称、厂商背书 \\
+高可用 & 单实例，无集群 & 多副本、跨区域高可用 \\
+功能完整度 & 信封加密、生命周期、RBAC、审计 & 上述功能 + 合规、审批流、配额等 \\
+适用场景 & 教学、研究、原型演示 & 生产环境密钥托管 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{本章小结}
+
+本章通过 8 个自动化测试用例验证了系统在本地模式与可信模式下的鉴权、密钥生命周期、加解密往返、密钥轮换与审计等功能的正确性，其中可信模式用例端到端地验证了远程认证、安全信道与 Enclave 后端的联通。本章进一步分析了关键安全属性，并诚实标注了测试覆盖的边界（如密文篡改专项用例待补强）。在性能方面，本章给出了本地与可信模式的对比实验设计，但未提供实测数值。最后，本章通过与云 KMS 的定性对比厘清了系统的适用边界。

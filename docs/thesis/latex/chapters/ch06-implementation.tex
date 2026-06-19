@@ -1,0 +1,105 @@
+% ==================== 第 6 章 系统实现与部署 ====================
+\chapter{系统实现与部署}
+\label{ch:impl}
+
+本章介绍系统的具体实现与部署方式，包括技术栈、代码组织、配置与一键启动流程，以及对容器化部署现状的说明。本章所述均对应仓库中的实际文件，便于复现。
+
+\section{技术栈}
+
+系统 Host 侧基于 Python 与 FastAPI 框架实现，主要技术选型如表~\ref{tab:stack} 所示。Enclave 侧除使用 \code{cryptography} 库完成 AES-GCM 加解密外，主要依赖 Python 标准库（\code{socket}、\code{struct}、\code{json}、\code{hashlib}、\code{hmac}）实现通信与认证，依赖较轻，便于审阅与移植。
+
+\begin{table}[H]
+\centering
+\caption{主要技术栈}
+\label{tab:stack}
+\small
+\begin{tabularx}{\textwidth}{L{3.6cm} Y}
+\toprule
+方面 & 选型 \\
+\midrule
+语言与运行时 & Python 3.12 \\
+Web 框架 & FastAPI（自带 Swagger / OpenAPI 文档） \\
+ORM 与数据库 & SQLAlchemy 2.x；默认 SQLite，可通过 \code{DATABASE_URL} 迁移至 PostgreSQL \\
+身份认证 & JWT Bearer 令牌（PyJWT），HMAC-SHA256 签名 \\
+口令哈希 & bcrypt \\
+密码学 & \code{cryptography} 库，AES-256-GCM \\
+Host$\leftrightarrow$Enclave 通信 & TCP（环回）或 Unix Domain Socket \\
+测试 & pytest 与 FastAPI TestClient \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{代码组织}
+
+项目位于多项目工作区下，Host 侧与 Enclave 侧分置于两个目录，核心结构如下：
+
+\begin{lstlisting}[language={}]
+20_安全应用与实验/
+|-- start-trusted-kms.sh          # 一键启动（Enclave + API）
+|-- 密钥管理系统/                  # Host 侧（FastAPI / MiniKMS）
+|   |-- app/
+|   |   |-- main.py               # 应用入口，lifespan 连接 Enclave
+|   |   |-- config.py             # USE_ENCLAVE / MASTER_KEY / ENCLAVE_PORT
+|   |   |-- api/                  # auth, users, keys, crypto, audit 路由
+|   |   |-- services/             # 鉴权、密钥、加解密、审计、Enclave 客户端
+|   |   |-- models/               # ORM：user, key, audit_log
+|   |   |-- schemas/              # Pydantic 请求/响应模型
+|   |   `-- utils/                # security(JWT/bcrypt), permissions(RBAC)
+|   |-- tests/                    # test_minikms_api.py / test_trusted_kms.py
+|   `-- docs/                     # 设计文档、论文大纲与初稿
+`-- 机密计算/                      # Enclave 侧
+    `-- src/
+        |-- kms_enclave.py        # KMS 专用 Enclave（持有主密钥）
+        |-- enclave.py            # TEE 基类（认证、信道、密封存储）
+        `-- crypto.py             # AES-GCM、HMAC、measure_code
+\end{lstlisting}
+
+这一组织与第~\ref{ch:design}~章的模块划分（表~\ref{tab:modules}）一一对应：API 路由层薄、服务层承载业务逻辑、密码学后端通过 \code{enclave_client} 与 Enclave 解耦，使本地模式与可信模式得以共享同一套上层代码。
+
+\section{配置与部署}
+
+\subsection{配置项}
+
+系统通过环境变量（或 \code{.env} 文件）配置，关键项包括：\code{JWT_SECRET_KEY}（JWT 签名密钥）、\code{DATABASE_URL}（数据库连接串）、\code{USE_ENCLAVE}（运行模式开关）、\code{ENCLAVE_PORT} 或 \code{ENCLAVE_SOCKET_PATH}（Enclave 通信地址），以及仅在本地模式下需要的 \code{MASTER_KEY}。其中主密钥须为 Base64 编码的 32 字节值，可由如下命令生成：
+
+\begin{lstlisting}[language=bash]
+python -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+\end{lstlisting}
+
+如第~\ref{ch:design}~章所述，当 \code{USE_ENCLAVE=true} 时，配置层会强制忽略 Host 上的 \code{MASTER_KEY}，确保主密钥仅注入 Enclave 进程（落实 SR1）。
+
+\subsection{一键启动}
+
+为便于演示与复现，系统提供一键启动脚本 \code{start-trusted-kms.sh}。脚本自动从 \code{密钥管理系统/.env} 读取 \code{MASTER_KEY} 并\textbf{仅传递给 Enclave 进程}，随后以可信模式启动 Enclave 与 API，并打开 Swagger 文档：
+
+\begin{lstlisting}[language=bash]
+cd "/Users/.../20_安全应用与实验"
+./start-trusted-kms.sh
+# API 默认 http://127.0.0.1:8000/docs
+# 可选：API_PORT=8001 ENCLAVE_PORT=9788 ./start-trusted-kms.sh
+\end{lstlisting}
+
+启动后可通过健康检查接口 \code{GET /} 确认系统处于可信模式且 Enclave 已连接：
+
+\begin{lstlisting}[language={}]
+{
+  "service": "TrustedKMS",
+  "status": "ok",
+  "crypto_backend": "enclave",
+  "enclave": "connected"
+}
+\end{lstlisting}
+
+其中 \code{crypto_backend} 为 \code{enclave} 表示加解密由 Enclave 后端承载，\code{enclave} 为 \code{connected} 表示远程认证握手已成功、安全信道已建立。应用入口在 \code{lifespan} 中于启动时调用 \code{connect_and_attest()} 完成握手，并在关闭时释放连接。
+
+\subsection{手动启动}
+
+在需要分别观察两个进程时，也可手动启动：在一个终端中为 Enclave 设置 \code{MASTER_KEY} 与 \code{ENCLAVE_PORT} 并运行 \code{python -m src.kms_enclave}；在另一个终端中为 Host 设置 \code{USE_ENCLAVE=true} 与相同的 \code{ENCLAVE_PORT}（且\textbf{不设置} \code{MASTER_KEY}）并以 uvicorn 启动 API。此方式直观地体现了主密钥仅存在于 Enclave 进程这一设计。
+
+\section{容器化部署现状}
+
+仓库中提供了用于 Host 的 \code{Dockerfile} 与 \code{docker compose} 配置，可将 API 容器化运行。但需\textbf{诚实说明}：当前容器化仅覆盖 Host 侧，尚未将 Enclave 拆分为独立容器，因此可信模式的标准部署方式仍以本节的一键脚本（本机双进程）为主。将 Enclave 独立容器化、并在容器边界上重新审视信任假设，列入第~\ref{ch:conclusion}~章的未来工作。
+
+\section{本章小结}
+
+本章介绍了系统的实现与部署。系统以 Python/FastAPI 实现 Host 侧、以轻量依赖实现 Enclave 侧，代码组织与设计章节的模块划分一致；通过环境变量切换运行模式，并以一键启动脚本完成 Enclave 与 API 的联合部署与健康检查。本章亦如实说明了容器化部署目前仅覆盖 Host 侧这一现状。下一章将基于该实现开展测试与实验评估。

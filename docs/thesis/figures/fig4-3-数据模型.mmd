@@ -1,0 +1,38 @@
+%% 图 4-3 数据模型（ER 图）
+erDiagram
+    USER ||--o{ MANAGED_KEY : "创建"
+    MANAGED_KEY ||--o{ KEY_VERSION : "拥有版本"
+    USER ||--o{ AUDIT_LOG : "产生"
+    USER {
+        int id PK
+        string username
+        string email
+        string password_hash "bcrypt"
+        enum role "admin/key_manager/app_user"
+        enum status "active/disabled"
+    }
+    MANAGED_KEY {
+        string id PK "uuid"
+        string key_name
+        string key_type "AES-256-GCM"
+        enum key_status "active/disabled/revoked/destroyed"
+        int key_version
+        text encrypted_key_material "包装后DEK·可空"
+        string nonce "包装nonce·可空"
+        int created_by FK
+    }
+    KEY_VERSION {
+        int id PK
+        string key_id FK
+        int version
+        text encrypted_key_material "包装后DEK·可空"
+        string nonce
+    }
+    AUDIT_LOG {
+        int id PK
+        int user_id FK
+        string action
+        string target_type
+        string target_id
+        string result
+    }

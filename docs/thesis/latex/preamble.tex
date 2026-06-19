@@ -1,0 +1,98 @@
+% ============================================================
+%  preamble.tex —— 宏包、全局样式与自定义命令
+%  编译：xelatex（需 ctex；建议 xelatex 连续编译两次以生成目录/交叉引用）
+% ============================================================
+
+% --- 页面 ---
+\usepackage{geometry}
+\geometry{a4paper, left=3cm, right=3cm, top=3cm, bottom=3cm}
+
+% --- 数学与符号 ---
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+% --- 图形与表格 ---
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{float}
+\usepackage{caption}
+
+% --- 列表 ---
+\usepackage{enumitem}
+\setlist{nosep, leftmargin=2.2em}
+
+% --- 颜色与代码 ---
+\usepackage{xcolor}
+\usepackage{listings}
+
+% --- 绘图 ---
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, backgrounds, calc, automata}
+
+% --- 超链接（放在较后）---
+\usepackage[hidelinks]{hyperref}
+
+% --- 下划线在正文中正常显示（避免大量 \_ 转义）；须在 hyperref 之后加载 ---
+\usepackage{underscore}
+
+% --- 行距 ---
+\linespread{1.4}
+
+% --- 图表编号按“章-序号”，标签与标题间用空格（中文习惯：图 4-1 标题）---
+\renewcommand{\thefigure}{\thechapter-\arabic{figure}}
+\renewcommand{\thetable}{\thechapter-\arabic{table}}
+\renewcommand{\theequation}{\thechapter-\arabic{equation}}
+\captionsetup{labelsep=space, font=small}
+
+% --- 表格列类型 ---
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+% --- 代码样式 ---
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codekw}{RGB}{0,0,170}
+\definecolor{codecmt}{RGB}{0,120,0}
+\definecolor{codestr}{RGB}{160,0,0}
+\definecolor{rulegray}{gray}{0.6}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecmt},
+  stringstyle=\color{codestr},
+  numberstyle=\tiny\color{gray},
+  breaklines=true,
+  breakatwhitespace=false,
+  showstringspaces=false,
+  frame=single,
+  rulecolor=\color{rulegray},
+  columns=fullflexible,
+  keepspaces=true,
+  tabsize=2,
+}
+
+% --- 行内代码 ---
+\newcommand{\code}[1]{\texttt{#1}}
+
+% --- 带圈数字（①② 在拉丁/中文字体中可能缺字，统一用此宏绘制）---
+\newcommand{\cnum}[1]{\textcircled{\raisebox{0.3pt}{\scriptsize #1}}}
+
+% --- 减少 overfull：允许段落末行轻微伸展 ---
+\emergencystretch=2em
+
+% --- TikZ 通用样式 ---
+\tikzset{
+  box/.style   ={draw, rounded corners, align=center, inner sep=5pt,
+                 minimum height=9mm, font=\small, fill=white},
+  db/.style    ={draw, cylinder, shape border rotate=90, aspect=0.25,
+                 align=center, inner sep=4pt, font=\footnotesize, fill=white},
+  zone/.style  ={draw, dashed, rounded corners, inner sep=8mm},
+  flow/.style  ={-{Stealth[length=2.5mm]}, thick},
+  flowbi/.style={{Stealth[length=2.5mm]}-{Stealth[length=2.5mm]}, thick},
+  lbl/.style   ={font=\footnotesize, align=center},
+}

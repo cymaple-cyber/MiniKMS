@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models.key import KeyStatus, KeyVersion, ManagedKey
+from app.services.enclave_client import get_enclave_client
 
 DEK_ASSOCIATED_DATA = b"minikms-dek-v1"
 
@@ -55,6 +56,13 @@ def unwrap_dek(encrypted_key_material: str, nonce: str) -> bytes:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Key material cannot be used",
         )
+
+
+def generate_wrapped_dek() -> tuple[str, str]:
+    if get_settings().use_enclave:
+        return get_enclave_client().generate_wrapped_dek()
+    dek = generate_dek()
+    return wrap_dek(dek)
 
 
 def _load_active_key(db: Session, key_id: str) -> ManagedKey:
@@ -106,6 +114,21 @@ def encrypt_data(db: Session, *, key_id: str, plaintext: str) -> dict[str, str |
         db,
         key_id=key_id,
     )
+
+    if get_settings().use_enclave:
+        data_nonce, ciphertext = get_enclave_client().encrypt_data(
+            key_id=key.id,
+            encrypted_key_material=encrypted_key_material,
+            key_nonce=key_nonce,
+            plaintext=plaintext,
+        )
+        return {
+            "key_id": key.id,
+            "key_version": key_version,
+            "nonce": data_nonce,
+            "ciphertext": ciphertext,
+        }
+
     dek = unwrap_dek(encrypted_key_material, key_nonce)
     nonce = os.urandom(12)
     ciphertext = AESGCM(dek).encrypt(
@@ -134,6 +157,16 @@ def decrypt_data(
         key_id=key_id,
         key_version=key_version,
     )
+
+    if get_settings().use_enclave:
+        return get_enclave_client().decrypt_data(
+            key_id=key.id,
+            encrypted_key_material=encrypted_key_material,
+            key_nonce=key_nonce,
+            nonce=nonce,
+            ciphertext=ciphertext,
+        )
+
     dek = unwrap_dek(encrypted_key_material, key_nonce)
     try:
         plaintext = AESGCM(dek).decrypt(

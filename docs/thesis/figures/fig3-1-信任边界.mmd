@@ -1,0 +1,16 @@
+%% 图 3-1 系统信任边界与数据流
+flowchart TB
+    subgraph Z1["调用方区域（不可信网络）"]
+        C["客户端 / Swagger<br/>Admin · Key Manager · App User"]
+    end
+    subgraph Z2["Host 区域（可信模式下视为不可信）"]
+        H["MiniKMS Host<br/>FastAPI · JWT/RBAC · 审计"]
+        DB[("SQLite<br/>包装后的 DEK · 业务密文 · 日志")]
+    end
+    subgraph Z3["Enclave 区域（模拟可信 · 持有 Master Key）"]
+        E["KmsEnclave<br/>生成/包装/解包 DEK · AES-GCM 加解密"]
+    end
+    C -- "① HTTP + JWT" --> H
+    H -- "② 本地 IPC + 远程认证 + AES-GCM 信道" --> E
+    E -- "②" --> H
+    H --- DB

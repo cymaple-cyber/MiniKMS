@@ -1,0 +1,14 @@
+%% 图 4-4 密钥状态机
+stateDiagram-v2
+    [*] --> active: create_key（version=1）
+    active --> active: rotate（version+1，保留旧版本）
+    active --> disabled: disable
+    active --> revoked: revoke
+    active --> destroyed: destroy（擦除包装材料）
+    disabled --> destroyed: destroy
+    revoked --> destroyed: destroy
+    destroyed --> [*]
+    note right of active
+        仅 active 可用于加解密；
+        rotate 要求 active
+    end note

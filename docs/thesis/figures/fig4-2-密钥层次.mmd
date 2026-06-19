@@ -1,0 +1,11 @@
+%% 图 4-2 密钥层次与信封加密流程
+flowchart TD
+    MK["L0 主密钥 Master Key<br/>32 字节 · 仅 Enclave 内存"]
+    DEK["L1 数据密钥 DEK<br/>32 字节随机 · 明文仅在 Enclave"]
+    DATA["L2 业务数据（明文）"]
+    WDEK["包装后的 DEK<br/>encrypted_key_material + nonce<br/>（存入数据库）"]
+    CT["业务密文 + nonce<br/>（返回 / 存储）"]
+    MK -->|"AES-GCM 包装<br/>AAD = minikms-dek-v1"| WDEK
+    DEK -.->|被主密钥包装| WDEK
+    DEK -->|"AES-GCM 加密<br/>AAD = key_id"| CT
+    DATA -.->|被 DEK 加密| CT

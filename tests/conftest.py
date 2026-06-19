@@ -49,3 +49,13 @@ def login(client, username, password="Password123!"):
 
 def auth_header(token):
     return {"Authorization": f"Bearer {token}"}
+
+
+def create_key(client, token, key_name="demo-key"):
+    response = client.post(
+        "/keys",
+        headers=auth_header(token),
+        json={"key_name": key_name, "expires_at": None},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()

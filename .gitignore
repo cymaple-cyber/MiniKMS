@@ -9,6 +9,8 @@ data/
 .pytest_cache/
 .coverage
 htmlcov/
+.kms_enclave_storage/
+.enclave_storage/
+*.sealed
 NEXT_AGENT_HANDOFF.md
-docs/superpowers/
 开发学习笔记.*

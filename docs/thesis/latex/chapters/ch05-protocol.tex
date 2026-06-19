@@ -1,0 +1,150 @@
+% ==================== 第 5 章 关键协议与算法实现 ====================
+\chapter{关键协议与算法实现}
+\label{ch:protocol}
+
+本章详述系统的关键协议与算法实现，包括信封加密、远程认证握手、安全信道、Enclave 内 KMS 操作、密钥轮换以及审计与权限控制。所有描述均对应现有代码，并在涉及安全强度处与第~\ref{ch:threat}~章的边界声明保持一致。
+
+\section{信封加密实现}
+\label{sec:envelope-impl}
+
+信封加密是系统密钥保护的核心。其实现分布在 Host 侧（本地模式）与 Enclave 侧（可信模式），二者算法一致，仅执行位置不同。
+
+\textbf{DEK 生成。} 每把受管密钥对应一把随机数据密钥，由 \code{os.urandom(32)}（Enclave 侧为 \code{secure_random(32)}）生成 32 字节随机值。
+
+\textbf{包装（wrap）。} 用主密钥对 DEK 做 AES-256-GCM 加密。实现中生成 12 字节随机 nonce，以固定串 \code{minikms-dek-v1} 作为关联数据（AAD），得到密文与认证标签，最终将密文与 nonce 以 URL-safe Base64 编码后返回。对应核心逻辑为：
+
+\begin{lstlisting}[language=Python]
+DEK_ASSOCIATED_DATA = b"minikms-dek-v1"
+
+def wrap_dek(dek: bytes) -> tuple[str, str]:
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(master_key).encrypt(nonce, dek, DEK_ASSOCIATED_DATA)
+    return b64(ciphertext), b64(nonce)
+\end{lstlisting}
+
+\textbf{解包（unwrap）。} 用主密钥与相同的 AAD 对包装后的 DEK 做 AES-GCM 解密；若认证标签校验失败（密文被篡改或主密钥不匹配），统一抛出“密钥材料不可用”的通用错误，不泄露内部细节（落实 SR3）。
+
+\textbf{数据加密。} 取得明文 DEK 后，以 DEK 对业务明文做 AES-256-GCM 加密，每次生成新的 12 字节随机 nonce（落实 SR2），并以该密钥的 \code{key_id} 作为 AAD，从而把密文与密钥身份绑定：
+
+\begin{lstlisting}[language=Python]
+data_nonce = os.urandom(12)
+ciphertext = AESGCM(dek).encrypt(data_nonce, plaintext.encode(), key_id.encode())
+\end{lstlisting}
+
+在可信模式下，上述包装、解包与数据加解密\textbf{全部在 Enclave 进程内完成}，明文 DEK 在用完后即被局部置零；Host 只接触包装后的 DEK 与密文。
+
+\section{远程认证协议}
+\label{sec:attestation}
+
+可信模式下，Host 启动时与 Enclave 完成一次远程认证握手，建立会话密钥。握手流程如图~\ref{fig:attest} 所示。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >={Stealth[length=2mm]}]
+  \node[box] (Hh) at (0,0)  {Host（MiniKMS）};
+  \node[box] (Eh) at (8.4,0) {Enclave（KmsEnclave）};
+  \draw[dashed] (Hh.south) -- (0,-9.6);
+  \draw[dashed] (Eh.south) -- (8.4,-9.6);
+  \draw[->] (0,-1.0) -- node[above]{1.~attestation\_request} (8.4,-1.0);
+  \draw[<-] (0,-2.1) -- node[above, align=center]{2.~attestation\_response：\\ measurement + identity\_key（明文）} (8.4,-2.1);
+  \node[right, text=blue!50!black] at (0.1,-2.9) {3.~校验 measurement = SHA256(code)};
+  \draw[->] (0,-3.8) -- node[above]{4.~attestation\_challenge：nonce（32B）} (8.4,-3.8);
+  \draw[<-] (0,-4.9) -- node[above, align=center]{5.~attestation\_proof：\\ HMAC(identity\_key, nonce $\Vert$ measurement)} (8.4,-4.9);
+  \node[right, text=blue!50!black] at (0.1,-5.7) {6.~校验 HMAC 签名};
+  \draw[->] (0,-6.6) -- node[above, align=center]{7.~session\_key\_delivery：\\ Enc$_{\text{identity\_key}}$(session\_key)} (8.4,-6.6);
+  \node[left, text=blue!50!black] at (8.3,-7.4) {8.~解密得 session\_key};
+  \draw[<-] (0,-8.3) -- node[above]{9.~session\_established（经加密信道）} (8.4,-8.3);
+  \draw[<->, very thick] (0,-9.2) -- node[above]{安全信道建立（后续消息 AES-GCM + seq）} (8.4,-9.2);
+\end{tikzpicture}
+\caption{远程认证握手时序}
+\label{fig:attest}
+\end{figure}
+
+握手分为身份证明与会话密钥协商两个阶段。前六步中，Enclave 返回其代码度量值（\code{measurement}）与一把身份密钥（\code{identity_key}），Host 先比对度量值是否等于预期常量，再以随机挑战 nonce 要求 Enclave 用身份密钥对 \code{nonce $\Vert$ measurement} 做 HMAC 签名并验证，从而确认对端确实持有该身份密钥且代码度量符合预期；后三步中，Host 生成随机会话密钥，用身份密钥加密后下发，Enclave 解密得到会话密钥，并经由已加密的信道回送确认，握手完成。
+
+需要\textbf{诚实指出其安全边界}：本握手中的 \code{identity_key} 是\textbf{对称密钥且在第 2 步以明文传输}，会话密钥随后用它加密。因此该机制可以拒绝度量值不符或版本错误的 Enclave，但\textbf{不能抵御能够观测并主动操纵握手的攻击者}——这与真实 SGX 中由硬件根证书背书、私钥永不出 Enclave 的非对称远程认证存在本质差异。本文据此将其定位为\textbf{结构性模拟}，其有效性以第~\ref{ch:threat}~章的假设 A-4（本地可信握手信道）为前提。
+
+\section{安全信道}
+\label{sec:channel}
+
+握手成功后，Host 与 Enclave 之间的所有消息均通过安全信道传输。信道在传输层采用统一的帧格式：4 字节大端长度前缀加负载。认证阶段的负载为明文 JSON；认证完成后，负载为对 JSON 消息做 AES-256-GCM 加密的结果（密文内含 12 字节 nonce 与 16 字节认证标签）。
+
+为抵御重放攻击，每条加密消息均携带一个单调递增的序列号 \code{seq}：发送方维护 \code{send_seq}，接收方维护期望的 \code{recv_seq}，并在收到消息时校验 \code{seq} 是否等于期望值，不符则判定为重放并拒绝。GCM 的认证标签保证了消息完整性（篡改将导致解密失败），\code{seq} 保证了消息顺序与不可重放，二者共同落实 SR8。
+
+\section{Enclave 内 KMS 操作}
+\label{sec:kms-ops}
+
+安全信道建立后，Host 通过三类受保护消息请求 Enclave 完成密钥操作，如表~\ref{tab:kmsmsg} 所示。所有请求与响应均经加密信道传输；明文 DEK 始终不出 Enclave。
+
+\begin{table}[H]
+\centering
+\caption{Enclave 内 KMS 消息类型}
+\label{tab:kmsmsg}
+\small
+\begin{tabularx}{\textwidth}{L{4.6cm} L{2.0cm} Y}
+\toprule
+消息类型 & 方向 & 功能 \\
+\midrule
+\code{kms_generate_wrapped_dek} & Host$\rightarrow$Enclave & 生成随机 DEK 并用主密钥包装，返回包装后的 DEK 与 nonce \\
+\code{kms_encrypt} & Host$\rightarrow$Enclave & 解包 DEK 后对明文做 AES-GCM 加密，返回密文与 nonce \\
+\code{kms_decrypt} & Host$\rightarrow$Enclave & 解包 DEK 后对密文做 AES-GCM 解密，返回明文 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+以加密为例，一次 \code{/crypto/encrypt} 请求的全链路时序如图~\ref{fig:encflow} 所示。Host 在收到客户端请求后，先完成 JWT 鉴权并从数据库读取该密钥当前版本的包装后 DEK，再将密文请求（含 \code{key_id}、包装后 DEK 与待加密明文，\textbf{但不含明文 DEK}）经安全信道转发给 Enclave；Enclave 在内部解包 DEK、完成 AES-GCM 加密、将明文 DEK 局部置零后回送密文；Host 写入审计日志并将结果返回客户端。解密流程与之对称，区别在于 Enclave 执行解密且失败时返回通用错误。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >={Stealth[length=2mm]}]
+  \node[box] (Ch) at (0,0)   {Client};
+  \node[box] (Hh) at (5.2,0) {Host（MiniKMS）};
+  \node[box] (Eh) at (10.6,0){Enclave};
+  \draw[dashed] (Ch.south) -- (0,-7.4);
+  \draw[dashed] (Hh.south) -- (5.2,-7.4);
+  \draw[dashed] (Eh.south) -- (10.6,-7.4);
+  \draw[->] (0,-1.0) -- node[above, align=center]{1.~POST /crypto/encrypt\\ \{key\_id, plaintext\} + JWT} (5.2,-1.0);
+  \node[right, text=blue!50!black] at (5.3,-1.8) {2.~JWT 鉴权 + 读取包装后 DEK（DB）};
+  \draw[->] (5.2,-2.7) -- node[above, align=center]{3.~kms\_encrypt\\ \{key\_id, 包装DEK, plaintext\}} (10.6,-2.7);
+  \node[left, text=blue!50!black] at (10.5,-3.5) {4.~解包 DEK $\to$ AES-GCM 加密 $\to$ 置零 DEK};
+  \draw[<-] (5.2,-4.4) -- node[above, align=center]{5.~kms\_encrypt\_response\\ \{nonce, ciphertext\}} (10.6,-4.4);
+  \node[right, text=blue!50!black] at (5.3,-5.2) {6.~写审计日志（encrypt, success）};
+  \draw[<-] (0,-6.1) -- node[above, align=center]{7.~\{key\_id, key\_version,\\ nonce, ciphertext\}} (5.2,-6.1);
+\end{tikzpicture}
+\caption{加密请求全链路时序（Client $\to$ Host $\to$ Enclave $\to$ Host $\to$ Client）}
+\label{fig:encflow}
+\end{figure}
+
+\section{密钥轮换}
+\label{sec:rotation}
+
+密钥轮换用于限制单把 DEK 的使用时长与数据量。轮换仅允许对 \code{active} 状态的密钥执行：系统生成一把新的 DEK 并用主密钥包装，将密钥的 \code{key_version} 递增，把新版本的包装后 DEK 写入 \code{KeyVersion} 版本表，同时更新主记录的当前版本与轮换时间。关键在于，\textbf{历史版本的包装后 DEK 被保留}，因此使用旧版本加密的历史密文仍可凭其 \code{key_version} 正确解密（落实 SR4）。加密接口始终使用当前版本并在响应中返回 \code{key_version}；解密接口可显式指定 \code{key_version} 以解密历史密文。这一“新数据用新密钥、旧密文仍可解密”的设计在第~\ref{ch:eval}~章的轮换测试中得到验证。
+
+\section{审计与权限控制}
+\label{sec:audit-rbac}
+
+\textbf{权限控制。} 系统通过依赖注入实现 RBAC：需要特定角色的接口以 \code{require_roles(...)} 作为依赖，在进入业务逻辑前校验当前用户角色；校验失败返回 403，并记录 \code{permission_denied} 审计事件。普通鉴权接口则以 \code{get_current_user} 校验 JWT 有效性与用户状态。角色与接口的映射关系已在第~\ref{ch:design}~章表~\ref{tab:api} 中给出。
+
+\textbf{审计日志。} 系统对关键操作统一调用审计服务记录事件，字段包括用户、动作、目标类型与 ID、IP、User-Agent、结果与时间。当前记录的动作覆盖登录成功/失败、密钥的创建/查询/轮换/禁用/吊销/销毁、加解密以及越权拒绝等，如表~\ref{tab:auditactions} 所示，为事后追溯与异常检测提供依据（落实 SR6）。
+
+\begin{table}[H]
+\centering
+\caption{审计记录的关键动作}
+\label{tab:auditactions}
+\small
+\begin{tabularx}{\textwidth}{L{3.0cm} Y}
+\toprule
+类别 & 动作 \\
+\midrule
+认证 & \code{login_success}、\code{login_failed} \\
+密钥生命周期 & \code{create_key}、\code{rotate_key}、\code{disable_key}、\code{revoke_key}、\code{destroy_key} \\
+密钥查询 & \code{list_key_metadata}、\code{get_key_metadata} \\
+密码操作 & \code{encrypt}、\code{decrypt} \\
+访问控制 & \code{permission_denied}、\code{create_user} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{本章小结}
+
+本章详述了系统的关键协议与算法实现。信封加密以 AES-256-GCM 实现 DEK 的包装/解包与数据加解密，并以 AAD 实现用途与身份绑定；远程认证握手在建立会话密钥的同时验证 Enclave 身份，本章如实标注了其作为结构性模拟的安全边界；安全信道以 AES-GCM 加密与序列号防重放保证机密性、完整性与抗重放；Enclave 内 KMS 操作以三类受保护消息完成密钥服务，明文 DEK 始终不出 Enclave（图~\ref{fig:encflow}）；密钥轮换通过版本表兼顾安全性与历史可解密性；审计与 RBAC 共同提供访问控制与可追溯能力。下一章将介绍上述设计的具体实现与部署。

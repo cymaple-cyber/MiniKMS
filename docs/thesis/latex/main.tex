@@ -1,0 +1,61 @@
+% ============================================================
+%  面向模拟可信执行环境的轻量级密钥管理系统设计与实现
+%  本科毕业论文 / 技术报告 —— 初稿
+%
+%  编译方式（需 TeX Live / MiKTeX，含 ctex）：
+%     xelatex main.tex
+%     xelatex main.tex      % 第二次：生成目录、图表索引与交叉引用
+%
+%  说明：本模板为通用 ctexbook 排版，便于替换为所在院校的论文模板；
+%        各章正文位于 chapters/ 下，可直接 \input 到院校模板中复用。
+%  系统边界：Enclave 为软件模拟 TEE，非硬件 SGX，非生产级 KMS。
+% ============================================================
+% fontset=fandol：使用可自动下载的开源中文字体，跨引擎（tectonic / TeX Live）最稳。
+% 若想用 macOS 系统字体（宋体等），把 fontset=fandol 改为 fontset=mac。
+\documentclass[UTF8, fontset=fandol, a4paper, 12pt, openany, oneside]{ctexbook}
+
+\input{preamble}
+
+\ctexset{
+  chapter/name   = {第,章},
+  chapter/number = \arabic{chapter},
+}
+
+\title{\bfseries 面向模拟可信执行环境的\\轻量级密钥管理系统设计与实现}
+\author{（作者姓名）\\[2mm] \large 指导教师：（教师姓名）}
+\date{\today}
+
+\begin{document}
+
+% ---------------- 前置部分 ----------------
+\frontmatter
+\pagestyle{plain}
+
+\maketitle
+
+\input{chapters/abstract}
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+% ---------------- 正文部分 ----------------
+\mainmatter
+
+\input{chapters/ch01-introduction}
+\input{chapters/ch02-background}
+\input{chapters/ch03-threat-model}
+\input{chapters/ch04-design}
+\input{chapters/ch05-protocol}
+\input{chapters/ch06-implementation}
+\input{chapters/ch07-evaluation}
+\input{chapters/ch08-conclusion}
+
+% ---------------- 参考文献 ----------------
+\input{chapters/references}
+
+% ---------------- 附录 ----------------
+\appendix
+\input{chapters/appendix}
+
+\end{document}

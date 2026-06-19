@@ -1,0 +1,238 @@
+% ==================== 第 4 章 系统总体设计 ====================
+\chapter{系统总体设计}
+\label{ch:design}
+
+\begin{quote}\small
+本章描述系统的总体架构、密钥层次、模块划分、数据模型、API 与权限设计及密钥生命周期，均对应现有原型代码已实现的结构。涉及关键协议（远程认证、加解密时序）的细节在第~\ref{ch:protocol}~章展开，本章聚焦结构性设计。
+\end{quote}
+
+\section{设计目标与原则}
+
+依据第~\ref{ch:threat}~章的威胁模型与安全需求（SR1--SR8），系统设计遵循以下原则：（1）\textbf{最小可信计算基}，将最敏感的密码操作集中到尽可能小的可信组件（Enclave），使 Host 即便失陷也无法获得主密钥（对应 SR1）；（2）\textbf{信封加密分层}，采用“主密钥 $\rightarrow$ 数据密钥 $\rightarrow$ 业务数据”三层结构，降低主密钥的使用频率与暴露面；（3）\textbf{关注点分离}，Host 负责编排、鉴权、策略与审计，Enclave 负责密码学执行；（4）\textbf{纵深防御}，在传输、鉴权、授权、加密、审计多层叠加控制；（5）\textbf{可对照、可降级}，提供本地与可信两种后端，共享同一套 API 与数据模型；（6）\textbf{诚实边界}，不以软件模拟冒充硬件隔离。
+
+\section{总体架构}
+
+系统采用 \textbf{Host + Enclave 分离}的三层架构，如图~\ref{fig:arch} 所示。自上而下分别为调用方、Host（MiniKMS）与 Enclave（KmsEnclave），数据库由 Host 管理。
+
+\begin{figure}[H]
+\centering
+\resizebox{0.96\textwidth}{!}{%
+\begin{tikzpicture}[node distance=8mm]
+  \node[box] (C) {客户端 / Swagger};
+  \node[box, below=14mm of C] (API) {API 路由层\\[1pt]\footnotesize auth · users · keys · crypto · audit};
+  \node[box, below=8mm of API] (SVC) {服务层\\[1pt]\footnotesize auth · key · crypto · audit · enclave\_client};
+  \node[db, right=16mm of SVC] (DB) {SQLite\\元数据 · 包装DEK\\密文 · 日志};
+  \node[box, below=22mm of SVC] (OPS) {生成/包装/解包 DEK · AES-GCM 加解密};
+  \node[box, below=7mm of OPS] (MK) {Master Key（仅驻留于此）};
+  \draw[flow]   (C)   -- node[lbl, right]{\cnum{1} HTTP + JWT} (API);
+  \draw[flow]   (API) -- (SVC);
+  \draw[flow]   (SVC) -- node[lbl, above]{ORM} (DB);
+  \draw[flowbi] (SVC) -- node[lbl, left, align=left]{\cnum{2} 远程认证 + AES-GCM 信道\\ kms\_generate\_wrapped\_dek\\ kms\_encrypt / kms\_decrypt} (OPS);
+  \draw[flow]   (MK)  -- (OPS);
+  \begin{scope}[on background layer]
+    \node[zone, fit=(API)(SVC)(DB), label={[font=\footnotesize]right:Host：MiniKMS（不持有主密钥）}] {};
+    \node[zone, fit=(OPS)(MK),      label={[font=\footnotesize]right:Enclave：KmsEnclave（模拟 TEE，可信区）}] {};
+  \end{scope}
+\end{tikzpicture}}
+\caption{系统总体架构}
+\label{fig:arch}
+\end{figure}
+
+各层职责如下：\textbf{调用方层}通过 HTTP 访问 RESTful 接口，所有业务请求携带 JWT 令牌；\textbf{Host 层（MiniKMS）}基于 FastAPI 实现，含 API 路由层与服务层，并以 JWT 鉴权、RBAC 与审计作为横切关注点，管理 SQLite 数据库，但在可信模式下\textbf{既不持有主密钥，也不在本进程内解包 DEK}；\textbf{Enclave 层（KmsEnclave）}作为独立进程运行，持有主密钥，对外仅暴露生成并包装 DEK、加密、解密三类受保护操作，明文 DEK 在 Enclave 内临时解包、用完即弃。Host 与 Enclave 通过本地 IPC 通信，并在其上叠加远程认证与 AES-GCM 加密信道（边界\cnum{2}，详见第~\ref{ch:protocol}~章）。这一架构使“密钥策略”（在 Host）与“密钥材料”（在 Enclave）在物理上分置于不同进程，从而落实第~\ref{ch:threat}~章的核心信任边界。
+
+\section{密钥层次与信封加密}
+
+系统采用三层密钥/数据层次，如图~\ref{fig:keyhier} 与表~\ref{tab:keyhier} 所示。其核心思想是信封加密：用主密钥包装数据密钥，再以数据密钥加密业务数据；数据库中只保存被包装后的 DEK 与业务密文，主密钥与明文 DEK 均不落盘。
+
+\begin{figure}[H]
+\centering
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[every node/.style={font=\small}]
+  \node[box] (MK)   at (0,0)    {L0 主密钥 Master Key\\[1pt]\footnotesize 32 字节 · 仅 Enclave 内存};
+  \node[box] (DEK)  at (0,-2.3) {L1 数据密钥 DEK\\[1pt]\footnotesize 32 字节随机 · 明文仅在 Enclave};
+  \node[box] (DATA) at (0,-4.6) {L2 业务数据（明文）};
+  \node[box] (WDEK) at (8,-1.15){包装后的 DEK\\[1pt]\footnotesize encrypted\_key\_material + nonce\\[1pt]\footnotesize （存入数据库）};
+  \node[box] (CT)   at (8,-4.6) {业务密文 + nonce\\[1pt]\footnotesize （返回 / 存储）};
+  \draw[flow]        (MK.east)  -- node[lbl, above, align=center]{AES-GCM 包装\\AAD = minikms-dek-v1} (WDEK.west);
+  \draw[flow,dashed] (DEK.east) -- node[lbl, below]{被主密钥包装} (WDEK.west);
+  \draw[flow]        (DEK)      -- node[lbl, above, sloped]{AES-GCM 加密（AAD = key\_id）} (CT);
+  \draw[flow,dashed] (DATA)     -- node[lbl, below]{被 DEK 加密} (CT);
+\end{tikzpicture}}
+\caption{密钥层次与信封加密流程}
+\label{fig:keyhier}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{密钥层次}
+\label{tab:keyhier}
+\small
+\begin{tabularx}{\textwidth}{c L{2.6cm} L{3.0cm} L{3.4cm} Y}
+\toprule
+层级 & 名称 & 算法 / 长度 & 存放位置 & 关联数据（AAD） \\
+\midrule
+L0 & 主密钥 & AES-256 / 32 字节 & 仅 Enclave 内存（可信模式） & 包装 DEK：minikms-dek-v1 \\
+L1 & 数据密钥 DEK & 随机 32 字节 & 数据库中为密文（包装后） & 加密数据：key\_id \\
+L2 & 业务数据 & AES-256-GCM 密文 & 客户端 / 数据库 & --- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+设计上有两点值得说明。其一，\textbf{关联数据（AAD）的绑定作用}：包装 DEK 时以固定串 \code{minikms-dek-v1} 作为 AAD，使包装结果与用途绑定；加密业务数据时以 \code{key_id} 作为 AAD，使密文与具体密钥身份绑定，可防止跨密钥的密文混用。其二，\textbf{主密钥的低暴露}：主密钥仅参与 DEK 的包装/解包，不直接加密业务数据，且在可信模式下从不进入 Host，符合 SR1。
+
+\section{模块划分}
+
+系统按职责划分为若干模块，Host 侧与 Enclave 侧分列，对应文件如表~\ref{tab:modules} 所示。
+
+\begin{table}[H]
+\centering
+\caption{模块职责与对应文件}
+\label{tab:modules}
+\footnotesize
+\begin{tabularx}{\textwidth}{L{2.4cm} Y L{4.6cm}}
+\toprule
+模块 & 职责 & 主要文件 \\
+\midrule
+Auth（鉴权） & 注册、登录、签发/校验 JWT、口令哈希 & \code{api/auth.py}、\code{services/auth_service.py}、\code{utils/security.py} \\
+Users（用户管理） & 创建用户、查看用户列表 & \code{api/users.py}、\code{services/user_service.py} \\
+Key Service（密钥生命周期） & 元数据、创建/轮换/禁用/吊销/销毁 & \code{api/keys.py}、\code{services/key_service.py} \\
+Crypto Service（加解密转发） & 按模式分派至本地后端或 Enclave & \code{api/crypto.py}、\code{services/crypto_service.py} \\
+Enclave Client（Host 侧客户端） & 远程认证、安全信道、KMS 消息收发 & \code{services/enclave_client.py} \\
+KmsEnclave（Enclave 服务端） & 持有主密钥，包装/解包 DEK，加解密 & \code{机密计算/src/kms_enclave.py} 等 \\
+Audit（审计） & 记录关键操作与结果 & \code{api/audit.py}、\code{services/audit_service.py} \\
+RBAC / 权限 & 基于角色的接口访问控制 & \code{utils/permissions.py} \\
+数据模型 & 用户、密钥、版本、审计 ORM & \code{models/*.py} \\
+配置与启动 & 模式切换、连接、健康检查、一键启动 & \code{config.py}、\code{main.py}、\code{start-trusted-kms.sh} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+其中，\textbf{Crypto Service 是模式无关性的关键}：上层 API 始终调用同一组加解密函数，由 Crypto Service 根据 \code{USE_ENCLAVE} 决定是在本进程内用主密钥解包 DEK 后加解密（本地模式），还是把请求转发给 Enclave（可信模式）。这使两种模式对上层透明，也保证了数据模型与接口的一致性。
+
+\section{运行模式设计}
+
+系统支持两种运行模式，由环境变量 \code{USE_ENCLAVE} 切换，差异见表~\ref{tab:modes}。配置加载时（\code{config.py} 的 \code{validate_crypto_mode}）会做一致性校验：当 \code{USE_ENCLAVE=true} 时\textbf{强制忽略} Host 上可能残留的 \code{MASTER_KEY}（置空），确保主密钥不会在 Host 端被误用；当 \code{USE_ENCLAVE=false} 而又未配置 \code{MASTER_KEY} 时直接拒绝启动。
+
+\begin{table}[H]
+\centering
+\caption{本地模式与可信模式对比}
+\label{tab:modes}
+\small
+\begin{tabularx}{\textwidth}{L{3.4cm} Y Y}
+\toprule
+维度 & 本地模式（\code{USE_ENCLAVE=false}） & 可信模式（\code{USE_ENCLAVE=true}） \\
+\midrule
+主密钥位置 & Host 的 \code{.env} & 仅 Enclave 进程 \\
+DEK 解包位置 & Host 内存 & Enclave 内存 \\
+数据加解密执行处 & Host 进程 & Enclave 进程 \\
+远程认证与加密信道 & 无 & 有 \\
+健康检查 \code{crypto_backend} & \code{local} & \code{enclave} \\
+适用场景 & 开发、单机、性能对照基线 & 论文主方案、演示可信托管 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+两种模式共享同一套 API、数据模型与业务逻辑，仅密码学后端不同。该设计便于开发与调试（本地模式无需启动 Enclave），也为第~\ref{ch:eval}~章的性能对照实验（本地 vs.\ 可信，量化 Enclave IPC 开销）提供了直接基础。
+
+\section{数据存储设计}
+
+系统数据模型包含用户、受管密钥、密钥版本与审计日志四类实体，关系如图~\ref{fig:er} 所示。数据库默认采用 SQLite，核心代码不绑定其特有特性，便于后续迁移至 PostgreSQL。
+
+\begin{figure}[H]
+\centering
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[every node/.style={font=\footnotesize}]
+  \node[box, align=left] (U)  at (0,0)
+     {\textbf{USER}\\ id (PK)\\ username, email\\ password\_hash (bcrypt)\\ role, status};
+  \node[box, align=left] (MK) at (7.5,0)
+     {\textbf{MANAGED\_KEY}\\ id (PK, uuid)\\ key\_name, key\_type\\ key\_status, key\_version\\ encrypted\_key\_material (可空)\\ nonce (可空), created\_by (FK)};
+  \node[box, align=left] (KV) at (7.5,-4.2)
+     {\textbf{KEY\_VERSION}\\ id (PK)\\ key\_id (FK), version\\ encrypted\_key\_material (可空)\\ nonce};
+  \node[box, align=left] (AL) at (0,-4.2)
+     {\textbf{AUDIT\_LOG}\\ id (PK)\\ user\_id (FK), action\\ target\_type, target\_id\\ result, created\_at};
+  \draw[flow] (U)  -- node[lbl, above]{创建 (1:N)} (MK);
+  \draw[flow] (MK) -- node[lbl, right]{拥有版本 (1:N)} (KV);
+  \draw[flow] (U)  -- node[lbl, left]{产生 (1:N)} (AL);
+\end{tikzpicture}}
+\caption{数据模型（ER 图）}
+\label{fig:er}
+\end{figure}
+
+设计要点如下：\textbf{ManagedKey} 保存元数据与当前版本的包装后 DEK；关键在于数据库\textbf{只存包装后的 DEK，不存明文 DEK，更不存主密钥}（落实 SR1 与 T1），且包装材料字段设计为可空以支持销毁时擦除。\textbf{KeyVersion} 以 (key\_id, version) 唯一约束保存每一轮换版本的包装后 DEK，从而在轮换后仍可解密历史密文（落实 SR4）。\textbf{AuditLog} 记录操作者、动作、目标、IP、User-Agent、结果与时间（支撑 SR6）。\textbf{User} 的口令仅存 bcrypt 哈希，角色字段驱动 RBAC。需注意，密钥“销毁”在本设计中表现为将相关行的包装材料字段置空（逻辑擦除），而非对底层存储介质的密码学粉碎。
+
+\section{API 设计与权限矩阵}
+
+系统对外提供 RESTful 接口，覆盖鉴权、用户管理、密钥生命周期、加解密与审计。访问控制基于 JWT + RBAC：未携带有效令牌的请求被拒（健康检查与注册/登录除外），需要管理权限的接口通过 \code{require_roles} 依赖限定角色。表~\ref{tab:api} 给出主要 API 与权限矩阵。
+
+{\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{longtable}{L{0.9cm} L{3.0cm} L{2.8cm} L{2.6cm} L{3.6cm}}
+\caption{主要 API 与权限矩阵}\label{tab:api}\\
+\toprule
+方法 & 路径 & 允许角色 & 审计动作 & 涉及 Enclave 操作 \\
+\midrule
+\endfirsthead
+\multicolumn{5}{l}{（续表~\ref{tab:api}）}\\
+\toprule
+方法 & 路径 & 允许角色 & 审计动作 & 涉及 Enclave 操作 \\
+\midrule
+\endhead
+\midrule \multicolumn{5}{r}{续下页}\\
+\endfoot
+\bottomrule
+\endlastfoot
+GET & / & 公开 & --- & ---（健康检查） \\
+POST & /auth/register & 公开 & ---（首用户 Admin） & --- \\
+POST & /auth/login & 公开 & login\_success/failed & --- \\
+GET & /auth/me & 任意已鉴权 & --- & --- \\
+POST & /users & Admin & create\_user & --- \\
+GET & /users & Admin & --- & --- \\
+POST & /keys & Admin / Key Manager & create\_key & kms\_generate\_wrapped\_dek \\
+GET & /keys & 任意已鉴权\newline (App User 仅 active) & list\_key\_metadata & --- \\
+GET & /keys/\{id\} & 任意已鉴权\newline (App User 仅 active) & get\_key\_metadata & --- \\
+POST & /keys/\{id\}/rotate & Admin / Key Manager & rotate\_key & kms\_generate\_wrapped\_dek \\
+POST & /keys/\{id\}/disable & Admin / Key Manager & disable\_key & --- \\
+POST & /keys/\{id\}/revoke & Admin / Key Manager & revoke\_key & --- \\
+DELETE & /keys/\{id\} & Admin / Key Manager & destroy\_key & --- \\
+POST & /crypto/encrypt & 任意已鉴权 & encrypt & kms\_encrypt \\
+POST & /crypto/decrypt & 任意已鉴权 & decrypt & kms\_decrypt \\
+GET & /audit/logs & Admin & --- & --- \\
+\end{longtable}
+}
+
+权限设计体现最小权限原则（SR7）：密钥的创建与生命周期管理仅限 Admin 与 Key Manager；审计日志与用户管理仅限 Admin；App User 只能查看 active 密钥的元数据并执行加解密。越权访问会被 \code{require_roles} 拒绝（403）并写入 \code{permission_denied} 审计记录。关于授权粒度需诚实说明：当前加解密接口对\textbf{任意已鉴权用户}开放，且不区分密钥归属——任何用户均可使用任意 active 密钥进行加解密；逐密钥 ACL 与多租户隔离不在本文范围（见第~\ref{ch:threat}~章 N8）。
+
+\section{密钥生命周期设计}
+
+受管密钥具有明确的状态机，如图~\ref{fig:fsm} 所示。密钥创建后处于 \code{active} 状态，仅 \code{active} 状态可用于加解密与轮换；\code{disabled}、\code{revoked}、\code{destroyed} 状态均不可用于密码操作。
+
+\begin{figure}[H]
+\centering
+\resizebox{0.9\textwidth}{!}{%
+\begin{tikzpicture}[->,>={Stealth[length=2mm]}, shorten >=1pt, auto, node distance=3.4cm,
+  every state/.style={draw, font=\small, minimum size=1.3cm}]
+  \node[state, initial, initial text={create\_key}] (A)            {active};
+  \node[state]            (Di) [right=of A]                        {disabled};
+  \node[state]            (R)  [below=of Di]                       {revoked};
+  \node[state, accepting] (De) [right=4cm of Di]                   {destroyed};
+  \path
+    (A)  edge [loop above]      node {rotate}  (A)
+    (A)  edge                   node {disable} (Di)
+    (A)  edge [bend right=18]   node [swap] {revoke} (R)
+    (A)  edge [bend left=30]    node {destroy} (De)
+    (Di) edge                   node {destroy} (De)
+    (R)  edge                   node [swap] {destroy} (De);
+\end{tikzpicture}}
+\caption{密钥状态机}
+\label{fig:fsm}
+\end{figure}
+
+各生命周期操作的设计如下：\textbf{创建}生成随机 DEK 并用主密钥包装，写入 \code{ManagedKey} 与第 1 版 \code{KeyVersion}，响应仅返回元数据；\textbf{轮换}仅允许对 \code{active} 密钥操作，生成新版本 DEK 并递增 \code{key_version}，保留历史版本使旧密文仍可凭版本号解密（SR4）；\textbf{禁用/吊销}将状态置为相应值使密钥不可再用于加解密，二者可对任何非 \code{destroyed} 密钥施加（为简洁，图~\ref{fig:fsm} 主要展示自 \code{active} 出发的路径）；\textbf{销毁}将状态置为 \code{destroyed} 并擦除当前与全部历史版本的包装后密钥材料（SR5），销毁为终态。
+
+\section{安全设计要点汇总}
+
+综合本章设计，系统的安全机制在多个层面落实第~\ref{ch:threat}~章的安全需求：信封加密三层结构加主密钥仅驻留 Enclave（SR1）；每次加密使用新随机 nonce（SR2）；Host$\leftrightarrow$Enclave 远程认证加 AES-GCM 会话加密加序列号防重放（SR8）；JWT 加 RBAC 最小权限（SR7）；关键操作审计（SR6）；解密失败统一错误（SR3）；轮换保留历史版本（SR4）、销毁擦除材料（SR5）。需再次诚实标注两处实现边界：其一，Enclave 用完明文 DEK 后将局部变量重置为零值，但这是受 Python 运行时限制的尽力而为清零；其二，主密钥在 Enclave 中以普通进程内存中的密钥对象形式持有，未经由基类的“加密内存”抽象。这些都是“软件模拟 TEE”定位下的合理取舍。
+
+\section{本章小结}
+
+本章给出了系统的总体设计。围绕“最小可信计算基”与“信封加密分层”两条主线，确立了 Host + Enclave 分离的三层架构（图~\ref{fig:arch}），使密钥策略与密钥材料在物理上分置；设计了主密钥—DEK—业务数据的三层密钥层次（图~\ref{fig:keyhier}、表~\ref{tab:keyhier}），保证数据库仅存包装后的 DEK 与业务密文。在此之上，本章给出了模块划分、双运行模式、数据模型（图~\ref{fig:er}）、API 与权限矩阵（表~\ref{tab:api}）以及密钥生命周期状态机（图~\ref{fig:fsm}），并逐项对应到安全需求 SR1--SR8。其中涉及的关键协议——远程认证握手与加解密全链路时序——将在第~\ref{ch:protocol}~章详细展开。

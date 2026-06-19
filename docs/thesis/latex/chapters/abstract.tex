@@ -1,0 +1,26 @@
+% ==================== 摘要 ====================
+\chapter*{摘要}
+\addcontentsline{toc}{chapter}{摘要}
+\markboth{摘要}{摘要}
+
+密钥管理是密码系统工程中最易出错的环节：密码算法本身相对成熟，但密钥的生成、存储、使用、轮换与销毁仍面临诸多工程挑战。在云环境与多租户等不可信主机（Host）场景下，若密钥管理系统（KMS）将主密钥与业务接口置于同一进程，一旦该进程被攻破，其保护的全部数据加密密钥将面临泄露风险。
+
+针对上述问题，本文设计并实现了一套 Host 与 Enclave 分离的轻量级密钥管理系统。系统采用信封加密构建“主密钥—数据密钥—业务数据”的三层结构，将主密钥的持有、数据密钥的包装与解包以及数据加解密等敏感操作迁移至模拟可信执行环境（TEE）的 Enclave 进程；Host 仅负责鉴权、访问控制、密钥元数据管理与审计，数据库中仅保存包装后的数据密钥与业务密文。Host 与 Enclave 之间通过远程认证建立会话密钥，并在其上使用 AES-256-GCM 加密信道，配合序列号实现防重放。系统基于 Python 与 FastAPI 实现，提供 JWT 鉴权、基于角色的访问控制（RBAC）、版本化密钥轮换与审计日志，并以一个一键启动脚本完成 Host 与 Enclave 的联合部署。
+
+本文建立了系统的威胁模型与安全需求，逐项给出已实现的缓解机制，并诚实界定了系统边界：本文 Enclave 为软件模拟而非硬件隔离，远程认证为结构性模拟，系统不防护物理攻击、侧信道以及 Enclave 自身被攻破等威胁。八项自动化集成测试验证了本地模式与可信模式下的鉴权、密钥生命周期、加解密往返与密钥轮换等功能的正确性。结果表明，在“Host 不可信、Enclave 相对可信”的受控威胁模型下，本方案能够将主密钥与数据密钥的敏感操作隔离至 Enclave，为后续对接真实硬件 TEE 与后量子密钥封装提供了可扩展的工程原型。
+
+\vspace{1em}
+\noindent\textbf{关键词：}密钥管理系统；信封加密；可信执行环境；远程认证；AES-GCM；应用密码学
+
+% -------------------- English Abstract --------------------
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+Key management is the most error-prone part of cryptographic engineering: while cryptographic algorithms are relatively mature, the generation, storage, use, rotation, and destruction of keys remain challenging. In cloud and multi-tenant settings where the host is not fully trusted, a Key Management System (KMS) that keeps the master key in the same process as its business API exposes all derived data encryption keys once that process is compromised.
+
+To address this, this thesis designs and implements a lightweight KMS based on a Host/Enclave separation. The system uses envelope encryption to build a three-tier hierarchy of master key, data encryption key (DEK), and business data. Sensitive operations---holding the master key, wrapping and unwrapping DEKs, and performing data encryption/decryption---are moved into an Enclave process that simulates a Trusted Execution Environment (TEE). The Host is responsible only for authentication, access control, key metadata management, and auditing; the database stores only wrapped DEKs and ciphertext. The Host and the Enclave establish a session key through remote attestation and communicate over an AES-256-GCM channel with sequence numbers for replay protection. The prototype is implemented in Python with FastAPI, providing JWT authentication, role-based access control (RBAC), versioned key rotation, and audit logging, together with a one-command launch script that deploys the Host and the Enclave jointly.
+
+This thesis establishes a threat model and a set of security requirements, maps each requirement to an implemented mitigation, and honestly delineates the system boundary: the Enclave is a software simulation rather than hardware isolation, the remote attestation is a structural simulation, and the system does not defend against physical attacks, side channels, or compromise of the Enclave itself. Eight automated integration tests verify the correctness of authentication, key lifecycle, encryption/decryption round-trips, and key rotation in both the local and the trusted modes. The results show that, under a controlled threat model where the host is untrusted and the Enclave is relatively trusted, the proposed design isolates sensitive master-key and DEK operations within the Enclave, providing an extensible engineering prototype for future integration with real hardware TEEs and post-quantum key encapsulation.
+
+\vspace{1em}
+\noindent\textbf{Keywords:} Key Management System; Envelope Encryption; Trusted Execution Environment; Remote Attestation; AES-GCM; Applied Cryptography

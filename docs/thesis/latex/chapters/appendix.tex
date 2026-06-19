@@ -1,0 +1,139 @@
+% ==================== 附录 ====================
+% 进入附录前 main.tex 已调用 \appendix；此处仅配置编号样式。
+\ctexset{ chapter/name = {附录\ ,}, chapter/number = \Alph{chapter} }
+
+\chapter{主要 API 请求/响应示例}
+\label{app:api}
+
+以下示例省略了 JWT 令牌等头部，仅示意请求体与响应体（实际响应字段以代码为准）。
+
+\textbf{A.1 注册与登录}
+\begin{lstlisting}[language={}]
+POST /auth/register
+{ "username": "admin", "email": "admin@example.com", "password": "Password123!" }
+--> 201 { "id": 1, "username": "admin", "role": "admin", "status": "active" }
+
+POST /auth/login
+{ "username": "admin", "password": "Password123!" }
+--> 200 { "access_token": "<JWT>", "token_type": "bearer" }
+\end{lstlisting}
+
+\textbf{A.2 创建密钥（响应不含任何密钥材料）}
+\begin{lstlisting}[language={}]
+POST /keys
+{ "key_name": "demo-key", "expires_at": null }
+--> 201 {
+  "id": "f3c1...uuid", "key_name": "demo-key", "key_type": "AES-256-GCM",
+  "key_status": "active", "key_version": 1
+}
+\end{lstlisting}
+
+\textbf{A.3 加密与解密往返}
+\begin{lstlisting}[language={}]
+POST /crypto/encrypt
+{ "key_id": "f3c1...uuid", "plaintext": "hello Trusted KMS" }
+--> 200 { "key_id": "f3c1...uuid", "key_version": 1,
+          "nonce": "<b64>", "ciphertext": "<b64>" }
+
+POST /crypto/decrypt
+{ "key_id": "f3c1...uuid", "nonce": "<b64>", "ciphertext": "<b64>" }
+--> 200 { "plaintext": "hello Trusted KMS" }
+\end{lstlisting}
+
+\chapter{远程认证与 KMS 消息 JSON 格式}
+\label{app:proto}
+
+\textbf{B.1 远程认证握手消息}
+\begin{lstlisting}[language={}]
+Host  -> { "type": "attestation_request" }
+Enc   -> { "type": "attestation_response",
+           "measurement": "<hex>", "identity_key": "<hex>" }   # 明文
+Host  -> { "type": "attestation_challenge", "nonce": "<hex 32B>" }
+Enc   -> { "type": "attestation_proof", "signature": "<hex>" }  # HMAC
+Host  -> { "type": "session_key_delivery", "encrypted_key": "<hex>" }
+Enc   -> { "type": "session_established" }                      # 经加密信道
+\end{lstlisting}
+
+\textbf{B.2 KMS 操作消息（均经 AES-GCM 安全信道，含 seq）}
+\begin{lstlisting}[language={}]
+Host  -> { "type": "kms_generate_wrapped_dek" }
+Enc   -> { "type": "kms_generate_wrapped_dek_response",
+           "encrypted_key_material": "<b64>", "nonce": "<b64>" }
+
+Host  -> { "type": "kms_encrypt", "key_id": "...",
+           "encrypted_key_material": "<b64>", "key_nonce": "<b64>",
+           "plaintext": "..." }
+Enc   -> { "type": "kms_encrypt_response", "nonce": "<b64>", "ciphertext": "<b64>" }
+
+Host  -> { "type": "kms_decrypt", "key_id": "...",
+           "encrypted_key_material": "<b64>", "key_nonce": "<b64>",
+           "nonce": "<b64>", "ciphertext": "<b64>" }
+Enc   -> { "type": "kms_decrypt_response", "plaintext": "..." }
+\end{lstlisting}
+
+\chapter{核心代码片段}
+\label{app:code}
+
+以下片段摘自实际代码并略作精简（去除部分日志与注释），用于说明核心逻辑。
+
+\textbf{C.1 信封加密：DEK 的包装与解包（Enclave 侧）}
+\begin{lstlisting}[language=Python]
+DEK_ASSOCIATED_DATA = b"minikms-dek-v1"
+
+def _wrap_dek(self, dek):
+    nonce = secure_random(12)
+    ciphertext = self._master_aesgcm.encrypt(nonce, dek, DEK_ASSOCIATED_DATA)
+    return b64(ciphertext), b64(nonce)
+
+def _unwrap_dek(self, encrypted_key_material, nonce):
+    enc = b64decode(encrypted_key_material)
+    nonce_bytes = b64decode(nonce)
+    return self._master_aesgcm.decrypt(nonce_bytes, enc, DEK_ASSOCIATED_DATA)
+\end{lstlisting}
+
+\textbf{C.2 Enclave 内加密（明文 DEK 用完即置零）}
+\begin{lstlisting}[language=Python]
+def _handle_encrypt(self, conn, msg):
+    dek = self._unwrap_dek(msg["encrypted_key_material"], msg["key_nonce"])
+    data_nonce = secure_random(12)
+    ciphertext = AESGCM(dek).encrypt(
+        data_nonce, msg["plaintext"].encode(), msg["key_id"].encode())
+    dek = b"\x00" * 32  # best-effort zeroization (受 Python 运行时限制)
+    self._send_secure(conn, {
+        "type": "kms_encrypt_response",
+        "nonce": b64(data_nonce), "ciphertext": b64(ciphertext)})
+\end{lstlisting}
+
+\textbf{C.3 远程认证握手（Host 侧，精简）}
+\begin{lstlisting}[language=Python]
+send_raw({"type": "attestation_request"})
+msg = recv_raw()
+measurement  = bytes.fromhex(msg["measurement"])
+identity_key = bytes.fromhex(msg["identity_key"])
+assert measurement == expected_measurement      # 校验度量值
+
+challenge = secure_random(32)
+send_raw({"type": "attestation_challenge", "nonce": challenge.hex()})
+proof = recv_raw()
+assert hmac_verify(identity_key, challenge + measurement,
+                   bytes.fromhex(proof["signature"]))   # 校验 HMAC
+
+session_key = secure_random(32)
+enc = aes_gcm_encrypt(identity_key, session_key)
+send_raw({"type": "session_key_delivery", "encrypted_key": enc.hex()})
+assert recv_secure()["type"] == "session_established"
+\end{lstlisting}
+
+\chapter{测试与运行截图}
+\label{app:screens}
+
+本附录预留运行截图位置，建议插入：Swagger 接口文档、健康检查响应、审计日志查询，以及 \code{pytest} 全部用例通过（8 passed）的输出。
+
+\begin{figure}[H]
+\centering
+\fbox{\begin{minipage}[c][4.5cm][c]{0.8\textwidth}\centering\itshape
+（此处插入截图：Swagger / 健康检查 / 审计日志 / pytest 8 passed）
+\end{minipage}}
+\caption{运行截图（占位，待插入）}
+\label{fig:screens}
+\end{figure}

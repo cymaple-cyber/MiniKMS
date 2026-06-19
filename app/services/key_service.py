@@ -4,12 +4,11 @@ from sqlalchemy.orm import Session
 from app.models.key import KeyStatus, KeyVersion, ManagedKey, utc_now
 from app.models.user import User, UserRole
 from app.schemas.key_schema import KeyCreate
-from app.services.crypto_service import generate_dek, wrap_dek
+from app.services.crypto_service import generate_wrapped_dek
 
 
 def create_key(db: Session, *, payload: KeyCreate, creator: User) -> ManagedKey:
-    dek = generate_dek()
-    encrypted_key_material, nonce = wrap_dek(dek)
+    encrypted_key_material, nonce = generate_wrapped_dek()
     key = ManagedKey(
         key_name=payload.key_name,
         key_type=payload.key_type,
@@ -102,8 +101,7 @@ def rotate_key(db: Session, *, key_id: str) -> ManagedKey:
     _ensure_current_version_record(db, key)
 
     new_version = key.key_version + 1
-    dek = generate_dek()
-    encrypted_key_material, nonce = wrap_dek(dek)
+    encrypted_key_material, nonce = generate_wrapped_dek()
     key.key_version = new_version
     key.encrypted_key_material = encrypted_key_material
     key.nonce = nonce

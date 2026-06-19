@@ -1,0 +1,181 @@
+% ==================== 第 3 章 系统威胁模型与安全需求 ====================
+\chapter{系统威胁模型与安全需求}
+\label{ch:threat}
+
+\begin{quote}\small
+本章基于现有原型代码撰写，所述机制均对应已实现功能。系统边界：本文 Enclave 为软件模拟可信执行环境（TEE），非 Intel SGX 等硬件隔离，亦非生产级 KMS。本章在描述防护能力的同时，明确区分“已实现的缓解”与“假设/不在防护范围内的威胁”。
+\end{quote}
+
+\section{威胁建模方法与本章组织}
+
+密钥管理系统的安全性不取决于单个密码算法的强度，而取决于密钥在其整个生命周期中是否始终处于受控状态。因此在进入具体设计之前，有必要先建立清晰的威胁模型，明确“在何种假设下、防护何种攻击者、达到何种安全目标”。本章采用面向资产的轻量级威胁建模流程，依次完成资产识别、角色与信任边界刻画、攻击者建模、威胁分析与缓解、系统边界声明，并最终导出可验证的安全需求清单。
+
+需要说明的是，本章给出的是\textbf{设计级（design-level）威胁模型}，用于指导系统设计与测试，并非形式化的协议安全证明；形式化验证列入第~\ref{ch:conclusion}~章的未来工作。在威胁分类视角上，本章借鉴 STRIDE 中的信息泄露、篡改、假冒与权限提升等维度，但以“资产—威胁—缓解”的工程化表格形式呈现，以便与具体实现一一对应。
+
+\section{资产识别}
+
+系统的安全设计围绕密钥层次展开。表~\ref{tab:assets} 列出需要保护的核心资产、存放位置及敏感级别。其中主密钥（Master Key）是整个信封加密体系的信任根，一旦泄露将导致其保护的全部数据密钥（DEK）及业务数据失陷，故列为最高敏感级别。
+
+\begin{table}[H]
+\centering
+\caption{关键资产清单}
+\label{tab:assets}
+\footnotesize
+\begin{tabularx}{\textwidth}{c L{3.0cm} L{3.6cm} c Y}
+\toprule
+编号 & 资产 & 存放位置 & 敏感级别 & 泄露后果 \\
+\midrule
+A1 & 主密钥（L0，32 字节） & 仅 Enclave 进程内存（可信模式） & 极高 & 全部 DEK 与业务数据失陷 \\
+A2 & 明文 DEK（L1，32 字节） & 仅在 Enclave 内临时存在 & 高 & 对应密钥下业务数据失陷 \\
+A3 & 包装后的 DEK & 数据库 & 中 & 仅在同时获得主密钥时才有价值 \\
+A4 & 业务明文 / 密文 & 客户端 / 数据库 & 中 & 单条业务数据泄露 \\
+A5 & 口令哈希、JWT 签名密钥 & Host（bcrypt 哈希 / 环境变量） & 高 & 身份冒充、令牌伪造 \\
+A6 & 审计日志 & 数据库 & 中 & 抵赖、痕迹清除 \\
+A7 & 会话密钥、Enclave 身份密钥 & Host/Enclave 进程内存 & 高 & 信道被解密 / 冒充 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+按敏感级别排序，系统设计的首要目标是保护 A1 与 A2，即\textbf{让主密钥与明文 DEK 不出现在 Host 环境中}；这正是引入模拟 Enclave 的根本动机。
+
+\section{系统角色与信任边界}
+
+\subsection{系统角色}
+
+系统涉及以下参与方：\textbf{调用方（Client）}通过 HTTP 接口访问系统，凭 JWT 鉴权，分为 Admin、Key Manager、App User 三类；\textbf{Host（MiniKMS）}负责鉴权、RBAC、密钥元数据管理与审计，并在可信模式下\textbf{不持有}主密钥、\textbf{不解包} DEK；\textbf{数据库（DB）}保存元数据、包装后的 DEK、业务密文与日志，\textbf{不保存}主密钥与明文 DEK；\textbf{Enclave（KmsEnclave）}持有主密钥，负责生成/包装 DEK、解包 DEK 并在内部完成数据加解密，明文 DEK 不离开 Enclave；此外，\textbf{被动网络观察者/恶意运维}作为潜在攻击者纳入考虑。
+
+\subsection{信任边界}
+
+系统存在两条关键信任边界，如图~\ref{fig:trust} 所示。边界\cnum{1}（调用方 $\leftrightarrow$ Host）要求调用方通过 JWT 鉴权并受 RBAC 约束；边界\cnum{2}（Host $\leftrightarrow$ Enclave）是本文威胁模型的核心：在可信模式下，Host 被视为\textbf{对密钥机密性而言不可信}，主密钥被隔离在边界另一侧的 Enclave 中，二者通过本地 IPC 连接，并在其上叠加远程认证与 AES-GCM 加密信道。
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[node distance=24mm]
+  \node[box] (C) {客户端 / Swagger\\[1pt]\footnotesize Admin · Key Manager · App User};
+  \node[box, right=of C] (H) {MiniKMS Host\\[1pt]\footnotesize FastAPI · JWT/RBAC · 审计};
+  \node[box, right=of H] (E) {KmsEnclave\\[1pt]\footnotesize 包装/解包 DEK · AES-GCM};
+  \node[db, below=16mm of H] (DB) {SQLite\\包装后 DEK\\密文 · 日志};
+  \draw[flow]   (C) -- node[lbl, above]{\cnum{1} HTTP + JWT} (H);
+  \draw[flowbi] (H) -- node[lbl, above]{\cnum{2} 远程认证\\+ AES-GCM 信道} (E);
+  \draw[thick]  (H) -- (DB);
+  \begin{scope}[on background layer]
+    \node[zone, fit=(C),       label=below:{\footnotesize 调用方区域（不可信网络）}] {};
+    \node[zone, fit=(H)(DB),   label=below:{\footnotesize Host 区域（可信模式下视为不可信）}] {};
+    \node[zone, fit=(E),       label=below:{\footnotesize Enclave 区域（模拟可信 · 持有 Master Key）}] {};
+  \end{scope}
+\end{tikzpicture}}
+\caption{系统信任边界与数据流}
+\label{fig:trust}
+\end{figure}
+
+\subsection{信任假设}
+
+本章威胁模型建立在以下假设之上：
+
+\begin{itemize}
+  \item \textbf{A-1（Enclave 相对可信）}：Enclave 进程未被攻破，其内存与执行流程不被外部读取或篡改。\textbf{此假设由模拟环境约定保证，而非硬件强制}——真实部署中需由 SGX 等硬件 TEE 提供，本文以独立进程加主密钥仅注入 Enclave 的方式进行结构性模拟。
+  \item \textbf{A-2（Host 可能被攻破）}：可信模式下允许 Host 进程被控制或其内存/环境变量被窥探；设计目标是即便如此，主密钥与明文 DEK 也不落入攻击者之手。
+  \item \textbf{A-3（数据库不可信）}：允许攻击者获得数据库文件的完整副本。
+  \item \textbf{A-4（本地可信 IPC）}：Host 与 Enclave 部署于同一主机，经环回 TCP 或 Unix Domain Socket 通信；假设攻击者无法在该本地信道的\textbf{握手阶段}进行主动中间人攻击（必要性见第~\ref{sec:threat-analysis}~节 T4）。
+  \item \textbf{A-5（合法用户经鉴权）}：所有业务接口调用者均须持有有效 JWT，且其角色受 RBAC 约束。
+\end{itemize}
+
+需强调，\textbf{本地模式}（\code{USE_ENCLAVE=false}）下主密钥位于 Host 的 \code{.env}，此时 Host 属可信区，A-2 不成立。本地模式仅用于开发与对照实验，本章以\textbf{可信模式为主要分析对象}，本地模式作为对照基线。
+
+\section{攻击者模型}
+
+综合上述资产与边界，本文考虑具备以下能力的攻击者：\textbf{C-1} 数据库泄露（读取或导出全部表内容）；\textbf{C-2} Host 进程窥探（读取 Host 内存、环境变量与配置）；\textbf{C-3} 被动窃听（监听调用方$\leftrightarrow$Host 流量，以及握手之后的 Host$\leftrightarrow$Enclave 信道）；\textbf{C-4} 主动篡改/重放（篡改或重放 Host$\leftrightarrow$Enclave 信道消息）；\textbf{C-5} 冒充 Enclave（以伪造或错误版本的 Enclave 应答）；\textbf{C-6} 越权调用（以合法低权限身份尝试越权操作）。不在攻击者能力范围内的情形统一在第~\ref{sec:boundary}~节声明。
+
+\section{威胁分析与缓解措施}
+\label{sec:threat-analysis}
+
+针对上述攻击者能力，表~\ref{tab:threats} 给出系统已实现的缓解机制及对应代码位置。
+
+\begin{table}[H]
+\centering
+\caption{威胁分析与缓解措施}
+\label{tab:threats}
+\footnotesize
+\begin{tabularx}{\textwidth}{c L{3.3cm} Y L{3.4cm}}
+\toprule
+编号 & 威胁（攻击者能力） & 缓解机制 & 实现位置 \\
+\midrule
+T1 & C-1 数据库泄露 & DB 仅存包装后的 DEK 与业务密文，不含主密钥与明文 DEK；销毁时擦除包装材料 & \code{models/key.py}、\code{key_service.destroy_key} \\
+T2 & C-2 Host 窥探（可信模式） & 主密钥仅在 Enclave；Host 配置强制将 \code{master_key} 置空；解包与加解密在 Enclave 内完成 & \code{config.py}、\code{crypto_service}、\code{enclave_client} \\
+T3 & C-3 被动窃听 & Host$\leftrightarrow$Enclave 会话 AES-256-GCM 加密；调用方$\leftrightarrow$Host 假设由部署层 TLS 保护 & \code{enclave.py} 的安全收发 \\
+T4 & C-4 篡改/重放 & 信道消息带 GCM 认证标签（篡改即失败）+ 单调递增序列号 \code{seq}（重放即拒） & \code{enclave_client.py}、\code{enclave.py} \\
+T5 & C-5 冒充 Enclave & 远程认证：校验度量值 + 挑战-响应（HMAC）验证身份密钥 & \code{handle_attestation} 等 \\
+T6 & C-6 越权调用 & JWT + RBAC；App User 仅能使用 active 密钥、不能管理密钥；越权写审计 & \code{utils/permissions.py}、各 \code{api/*.py} \\
+T7 & 凭证泄露 & 口令仅存 bcrypt 哈希；响应从不返回密钥材料、口令哈希或主密钥 & \code{utils/security.py}、响应 schema \\
+T8 & 解密错误旁路 & 解密/解包失败统一返回通用错误，不暴露内部细节 & \code{crypto_service}、\code{kms_enclave} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+下面对若干关键威胁补充说明，并\textbf{诚实标注其残余风险}。
+
+\textbf{T2（Host 被攻破时的密钥保护）。} 可信模式下，即使攻击者完全控制 Host 进程，也无法直接读出主密钥或离线导出明文 DEK——这是本方案相对纯本地模式的核心安全增益。但须指出其\textbf{残余风险}：在一个已建立的认证会话存续期间，被攻陷的 Host 仍可向 Enclave 提交加解密请求，即 Enclave 对持有该会话的一方而言是一个“加解密预言机（oracle）”。因此本方案的保护边界应准确表述为——\textbf{主密钥不被窃取、无法离线/规模化解密历史数据}，而非“Host 被攻破后数据绝对安全”。会话或 Enclave 终止后，攻击者即丧失该能力。
+
+\textbf{T4 / T5（远程认证的真实强度）。} 当前远程认证可有效拒绝\textbf{版本错误或度量值不匹配的 Enclave}：Host 通过比对度量值（\code{SHA256("trusted-kms-enclave-v1.0")}）识别对端。但其密码学强度受模拟实现限制：身份密钥为\textbf{对称密钥且在握手阶段以明文传输}，会话密钥随后用该身份密钥加密下发。这意味着该认证\textbf{不能抵御能够观测并主动操纵握手过程的攻击者}——与真实 SGX 中由硬件根证书背书的非对称远程认证存在本质差异。故本文将其归类为\textbf{结构性模拟的远程认证}，并以假设 A-4 作为其成立前提。
+
+\section{明确不在防护范围内的威胁（系统边界）}
+\label{sec:boundary}
+
+为避免对原型能力的过度表述，本节明确声明表~\ref{tab:boundary} 所列威胁\textbf{不在}本文防护范围内。这些边界主要源于“软件模拟 TEE”这一根本定位。
+
+\begin{table}[H]
+\centering
+\caption{明确不在防护范围内的威胁}
+\label{tab:boundary}
+\footnotesize
+\begin{tabularx}{\textwidth}{c L{4.8cm} Y}
+\toprule
+编号 & 不防护的威胁 & 原因说明 \\
+\midrule
+N1 & 物理攻击、冷启动、总线探测 & 软件模拟，无硬件隔离与内存加密 \\
+N2 & 硬件/微架构侧信道（时序、缓存等） & 未做侧信道防护；不属本文主线 \\
+N3 & Enclave 进程本身被攻破 & 模拟下 Enclave 为普通进程，主密钥驻留普通内存，具 root/调试/内存转储能力者可读取 \\
+N4 & 同时控制 Host 与 Enclave 的攻击者 & 双端皆失陷时可在 Enclave 内解密，超出本模型 \\
+N5 & 对远程认证握手的主动中间人 & 受对称明文身份密钥限制，依赖假设 A-4 \\
+N6 & 调用方$\leftrightarrow$Host 的传输层加密（TLS） & 原型以 HTTP 运行，TLS 由部署层提供，未在原型实现 \\
+N7 & 令牌被盗后的即时吊销 & JWT 在有效期内有效，未实现刷新令牌与吊销列表 \\
+N8 & 细粒度/多租户密钥隔离 & 访问控制为角色级，任意已鉴权用户可用任意 active 密钥，无逐密钥 ACL \\
+N9 & 拒绝服务（DoS）与可用性攻击 & 本文聚焦机密性与完整性，不以可用性为目标 \\
+N10 & 供应链与依赖完整性 & 不在本文范围 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+此外需补充：基类 \code{Enclave} 虽提供“加密内存”与“密封存储”等抽象，但 KMS 的主密钥路径并未经由加密内存存放，而是以普通进程内存中的密钥对象形式持有；Enclave 用完明文 DEK 后会将局部变量重置为零值，这属于\textbf{尽力而为的清零}，受 Python 运行时（不可变 \code{bytes} 与垃圾回收）限制，并非保证性的内存擦除。上述说明与“模拟 TEE、非生产级 KMS”的定位一致。
+
+\section{安全需求}
+
+综合前述分析，本文导出如下可验证的安全需求。SR1--SR6 为核心需求，SR7--SR8 为支撑性需求；每条均标注其针对的威胁与落实位置，便于在第~\ref{ch:eval}~章验证。
+
+\begin{table}[H]
+\centering
+\caption{安全需求与落实位置}
+\label{tab:sr}
+\footnotesize
+\begin{tabularx}{\textwidth}{c Y L{2.4cm} L{4.0cm}}
+\toprule
+编号 & 安全需求 & 对应威胁/资产 & 落实位置 \\
+\midrule
+SR1 & 可信模式下主密钥不得出现在 Host 环境变量或进程内存中 & T2 / A1 & \code{config.py} 强制 \code{master_key=None}；加解密转发 Enclave \\
+SR2 & 每次数据加密使用新的随机 nonce（12 字节） & 机密性 / A4 & 加密路径调用 \code{os.urandom(12)} \\
+SR3 & 解密失败返回统一错误，不泄露内部细节 & T8 & \code{crypto_service}、\code{kms_enclave} \\
+SR4 & 密钥轮换后旧版本仍可解密历史密文 & 正确性 & \code{KeyVersion} 版本表 \\
+SR5 & 销毁密钥后擦除数据库中的包装后密钥材料 & T1 / A3 & \code{key_service.destroy_key} \\
+SR6 & 关键操作写入审计日志 & T6 / A6 & \code{audit_service.record_event} \\
+SR7 & 接口访问遵循最小权限 & T6 & \code{require_roles} 与各路由依赖 \\
+SR8 & Host$\leftrightarrow$Enclave 信道保证机密性、完整性并防重放 & T3/T4 & AES-GCM 会话加密 + \code{seq} 校验 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+这些需求构成第~\ref{ch:design}~章系统设计的约束，也是第~\ref{ch:eval}~章测试用例的设计依据。需注意 SR1、SR8 的有效性以信任假设（尤其 A-1、A-4）为前提；脱离这些假设，相应保证不再成立。
+
+\section{本章小结}
+
+本章建立了系统的威胁模型与安全需求。首先识别了以主密钥为信任根的核心资产，随后刻画了系统角色与两条信任边界（图~\ref{fig:trust}），其中 Host$\leftrightarrow$Enclave 边界是本文将主密钥隔离至模拟 Enclave 的关键。在此基础上，本章界定了攻击者能力，逐项分析了数据库泄露、Host 窥探、信道篡改、冒充 Enclave、越权调用等威胁并对应到代码实现（表~\ref{tab:threats}）。更重要的是，本章以独立小节（第~\ref{sec:boundary}~节）诚实声明了系统边界，避免对原型能力的夸大，并导出了 SR1--SR8 的安全需求清单（表~\ref{tab:sr}），作为后续设计与测试的统一约束。
